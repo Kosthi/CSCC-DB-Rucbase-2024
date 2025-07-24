@@ -24,17 +24,20 @@ See the Mulan PSL v2 for more details. */
 
 #include "analyze/analyze.h"
 #include "errors.h"
+#include "fmt/core.h"
+#include "fmt/printf.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/plan.h"
 #include "optimizer/planner.h"
 #include "portal.h"
 #include "recovery/log_recovery.h"
+#include "spdlog/spdlog.h"
 
 #define SOCK_PORT 8765
 #define MAX_CONN_LIMIT 8
 
 // 是否开启 std::cout
-// #define ENABLE_COUT
+#define ENABLE_COUT
 
 static bool should_exit = false;
 
@@ -93,7 +96,7 @@ void sigint_handler(int signo) {
   should_exit = true;
   log_manager->flush_log_to_disk();
 #ifdef ENABLE_COUT
-  std::cout << "The Server receive Crtl+C, will been closed\n";
+  spdlog::info("The Server receive Crtl+C, will been closed");
 #endif
   longjmp(jmpbuf, 1);
 }
@@ -129,14 +132,12 @@ void* client_handler(void* sock_fd) {
   yylex_init(&scanner);
 
 #ifdef ENABLE_COUT
-  std::string output =
-      "establish client connection, sockfd: " + std::to_string(fd) + "\n";
-  std::cout << output;
+  spdlog::info("establish client connection, sockfd: %d", fd);
 #endif
 
   while (true) {
 #ifdef ENABLE_COUT
-    // std::cout << "Waiting for request..." << std::endl;
+    spdlog::info("Waiting for request...", fd);
 #endif
     memset(data_recv, 0, BUFFER_LENGTH);
 
@@ -144,14 +145,14 @@ void* client_handler(void* sock_fd) {
 
     if (i_recvBytes == 0) {
 #ifdef ENABLE_COUT
-      std::cout << "Maybe the client has closed" << std::endl;
+      spdlog::info("Maybe the client has closed");
 #endif
       break;
     }
 
     if (i_recvBytes == -1) {
 #ifdef ENABLE_COUT
-      std::cout << "Client read error!" << std::endl;
+      spdlog::info("Client read error!");
 #endif
       break;
     }
@@ -161,12 +162,12 @@ void* client_handler(void* sock_fd) {
 #endif
 
     if (strcmp(data_recv, "exit") == 0) {
-      std::cout << "Client exit." << std::endl;
+      spdlog::info("Client exit.");
       break;
     }
 
     if (strcmp(data_recv, "crash") == 0) {
-      std::cout << "Server crash" << std::endl;
+      spdlog::info("Server crash");
       delete[] data_send;
       for (auto& [_, txn] : txn_manager->txn_map) {
         std::ignore = _;
@@ -218,7 +219,7 @@ void* client_handler(void* sock_fd) {
     futures.clear();
     pool_mutex.unlock();
 #ifdef ENABLE_COUT
-    std::cout << "Read from client " << fd << ": " << data_recv << std::endl;
+    spdlog::info("Read from client %d: %d", fd, data_recv);
 #endif
     memset(data_send, '\0', BUFFER_LENGTH);
     offset = 0;
@@ -338,7 +339,7 @@ void* client_handler(void* sock_fd) {
 
   // Clear
 #ifdef ENABLE_COUT
-  std::cout << "Terminating current client_connection..." << std::endl;
+  spdlog::info("Terminating current client_connection...");
 #endif
   close(fd);           // close a file descriptor.
   pthread_exit(NULL);  // terminate calling thread!
@@ -381,7 +382,7 @@ void start_server() {
 
   while (!should_exit) {
 #ifdef ENABLE_COUT
-    std::cout << "Waiting for new connection..." << std::endl;
+    spdlog::info("Waiting for new connection...");
 #endif
     // 解决局部变量析构问题
     int* sockfd = (int*)malloc(sizeof(int));
@@ -455,17 +456,18 @@ int main(int argc, char** argv) {
   signal(SIGTERM, sigint_handler);
   try {
 #ifdef ENABLE_COUT
-    std::cout << "\n"
-                 "  _____  __  __ _____  ____  \n"
-                 " |  __ \\|  \\/  |  __ \\|  _ \\ \n"
-                 " | |__) | \\  / | |  | | |_) |\n"
-                 " |  _  /| |\\/| | |  | |  _ < \n"
-                 " | | \\ \\| |  | | |__| | |_) |\n"
-                 " |_|  \\_\\_|  |_|_____/|____/ \n"
-                 "\n"
-                 "Welcome to RMDB!\n"
-                 "Type 'help;' for help.\n"
-                 "\n";
+    spdlog::info(
+        "\n"
+        "  _____  __  __ _____  ____  \n"
+        " |  __ \\|  \\/  |  __ \\|  _ \\ \n"
+        " | |__) | \\  / | |  | | |_) |\n"
+        " |  _  /| |\\/| | |  | |  _ < \n"
+        " | | \\ \\| |  | | |__| | |_) |\n"
+        " |_|  \\_\\_|  |_|_____/|____/ \n"
+        "\n"
+        "Welcome to RMDB!\n"
+        "Type 'help;' for help.\n"
+        "\n");
 #endif
     // Database name is passed by args
     std::string db_name = argv[1];
