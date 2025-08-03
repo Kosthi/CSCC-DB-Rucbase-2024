@@ -323,6 +323,8 @@ class SortExecutor : public AbstractExecutor {
                              ? compare(lhs, rhs, cols_.len, cols_.type) > 0
                              : compare(lhs, rhs, cols_.len, cols_.type) < 0;
                 });
+      current_tuple_ = std::move(records_.front());
+      records_.pop_front();
     }
 #endif
   }

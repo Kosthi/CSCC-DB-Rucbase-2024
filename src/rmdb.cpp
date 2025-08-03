@@ -132,12 +132,12 @@ void* client_handler(void* sock_fd) {
   yylex_init(&scanner);
 
 #ifdef ENABLE_COUT
-  spdlog::info("establish client connection, sockfd: %d", fd);
+  spdlog::info("establish client connection, sockfd: {}", fd);
 #endif
 
   while (true) {
 #ifdef ENABLE_COUT
-    spdlog::info("Waiting for request...", fd);
+    spdlog::info("Waiting for request... {}", fd);
 #endif
     memset(data_recv, 0, BUFFER_LENGTH);
 
@@ -219,7 +219,7 @@ void* client_handler(void* sock_fd) {
     futures.clear();
     pool_mutex.unlock();
 #ifdef ENABLE_COUT
-    spdlog::info("Read from client %d: %d", fd, data_recv);
+    spdlog::info("Read from client {}: {}", fd, data_recv);
 #endif
     memset(data_send, '\0', BUFFER_LENGTH);
     offset = 0;

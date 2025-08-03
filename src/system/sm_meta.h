@@ -10,19 +10,12 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
-#include <sys/socket.h>
-
 #include <algorithm>
-#include <iostream>
-#include <list>
-#include <map>
 #include <string>
 #include <unordered_map>
-#include <utility>
 #include <vector>
 
 #include "errors.h"
-#include "sm_defs.h"
 
 /* 字段元数据 */
 struct ColMeta {
@@ -143,7 +136,7 @@ struct TabMeta {
   std::vector<ColMeta> cols;  // 表包含的字段
   std::unordered_map<std::string, IndexMeta>
       indexes;  // 表上建立的索引 索引名 -> 索引元信息
-  std::unordered_map<std::string, std::vector<ColMeta>::iterator>
+  std::unordered_map<std::string, size_t>
       cols_map;  // 空间换时间，在 Analyze 阶段快速确定列是否存在
   std::unordered_map<std::vector<std::string>, std::string>
       index_names_map;  // cols name -> index file name
@@ -193,7 +186,7 @@ struct TabMeta {
     if (pos == cols_map.end()) {
       throw ColumnNotFoundError(col_name);
     }
-    return pos->second;
+    return cols.begin() + pos->second;
   }
 
   friend std::ostream& operator<<(std::ostream& os, const TabMeta& tab) {
@@ -217,8 +210,8 @@ struct TabMeta {
       is >> col;
       tab.cols.emplace_back(col);
     }
-    for (auto it = tab.cols.begin(); it != tab.cols.end(); ++it) {
-      tab.cols_map.emplace(it->name, it);
+    for (size_t i = 0; i < tab.cols.size(); ++i) {
+      tab.cols_map.emplace(tab.cols[i].name, i);
     }
     is >> n;
     std::string index_name;

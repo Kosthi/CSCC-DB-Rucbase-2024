@@ -55,7 +55,7 @@ class SeqScanExecutor : public AbstractExecutor {
     cond_cols_.reserve(conds_.size());
     for (auto& cond : conds_) {
       // 存迭代器
-      cond_cols_.emplace_back(tab_.cols_map[cond.lhs_col.col_name]);
+      cond_cols_.emplace_back(tab_.get_col(cond.lhs_col.col_name));
     }
 
     // S 锁

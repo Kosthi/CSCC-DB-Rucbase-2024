@@ -264,8 +264,8 @@ void SmManager::create_table(const std::string& tab_name,
     curr_offset += col_def.len;
     tab.cols.emplace_back(col);
   }
-  for (auto it = tab.cols.begin(); it != tab.cols.end(); ++it) {
-    tab.cols_map.emplace(it->name, it);
+  for (size_t i = 0; i < tab.cols.size(); ++i) {
+    tab.cols_map.emplace(tab.cols[i].name, i);
   }
   // Create & open record file
   int record_size =
