@@ -75,9 +75,6 @@ bool LockManager::lock_shared_on_gap(Transaction* txn, IndexMeta& index_meta,
 
     // 发生冲突
     if (lock_request_queue.group_lock_mode_ == GroupLockMode::X) {
-      // delete 算子
-      // 阻塞等待
-
       if (txn->get_transaction_id() > lock_request_queue.oldest_txn_id_) {
         throw TransactionAbortException(txn->get_transaction_id(),
                                         AbortReason::DEADLOCK_PREVENTION);
@@ -500,132 +497,140 @@ bool LockManager::lock_exclusive_on_gap(Transaction* txn, IndexMeta& index_meta,
  */
 bool LockManager::isSafeInGap(Transaction* txn, IndexMeta& index_meta,
                               RmRecord& record, int tab_fd) {
-  std::lock_guard lock(latch_);
+  std::unique_lock lock(latch_);
 
-  // if (!check_lock(txn)) {
-  //     return false;
-  // }
+  auto predicate_manager = PredicateManager(index_meta);
 
-  auto it = gap_lock_table_.find(index_meta);
+  // 手动写个 cond index_col = val
+  std::vector<Condition> conds(index_meta.cols.size());
+  int idx = 0;
+  for (auto& [index_offset, col_meta] : index_meta.cols) {
+    Value v;
+    v.raw =
+        std::make_shared<RmRecord>(record.data + col_meta.offset, col_meta.len);
+    switch (col_meta.type) {
+      case TYPE_INT: {
+        v.set_int(*reinterpret_cast<int*>(v.raw->data));
+        break;
+      }
+      case TYPE_FLOAT: {
+        v.set_float(*reinterpret_cast<float*>(v.raw->data));
+        break;
+      }
+      case TYPE_STRING: {
+        std::string s(v.raw->data, v.raw->size);
+        v.set_str(s);
+        break;
+      }
+    }
+    conds[idx].op = OP_EQ;
+    conds[idx].lhs_col = {"", col_meta.name};
+    conds[idx].rhs_val = std::move(v);
+    ++idx;
+  }
+  for (auto& cond : conds) {
+    predicate_manager.addPredicate(cond.lhs_col.col_name, cond);
+  }
 
-  int wait = 0;
+  auto gap = Gap(predicate_manager.getIndexConds());
+  LockDataId lock_data_id(tab_fd, index_meta, gap, LockDataType::GAP);
+
   while (true) {
-    wait = 0;
-    if (it != gap_lock_table_.end()) {
-      // 独占锁只要有区间相交就得等待
-      for (auto& [data_id, queue] : it->second) {
-        if (data_id.gap_.isInGap(record)) {
-          bool is_only_txn = true;
+    bool conflict_detected = false;
+
+    // 检查1：查找索引是否存在
+    auto outer_it = gap_lock_table_.find(index_meta);
+    if (outer_it != gap_lock_table_.end()) {
+      auto& inner_map = outer_it->second;
+
+      // 检查2：遍历所有间隙锁
+      for (auto& [data_id, queue] : inner_map) {
+        // 跳过不相交的间隙
+        if (!data_id.gap_.isInGap(record)) continue;
+
+        // 检查是否有其他事务持有锁
+        bool other_holder = false;
+        for (auto& req : queue.request_queue_) {
+          if (req.txn_id_ != txn->get_transaction_id() && req.granted_) {
+            other_holder = true;
+            break;
+          }
+        }
+
+        if (!other_holder) continue;  // 无冲突继续
+
+        // Wait-die死锁预防
+        if (txn->get_transaction_id() > queue.oldest_txn_id_) {
+          throw TransactionAbortException(txn->get_transaction_id(),
+                                          AbortReason::DEADLOCK_PREVENTION);
+        }
+
+        conflict_detected = true;
+        // 条件等待：直到没有其他持有者或事务中止
+        queue.cv_.wait(lock, [&] {
+          if (txn->get_state() == TransactionState::ABORTED) return true;
+
+          // 检查队列是否为空
+          if (queue.request_queue_.empty()) return true;
+
           for (auto& req : queue.request_queue_) {
-            if (req.txn_id_ != txn->get_transaction_id() && req.granted_) {
-              is_only_txn = false;
-              break;
-            }
+            if (req.txn_id_ != txn->get_transaction_id() && req.granted_)
+              return false;
           }
-          // 队列中没有其他事务取得锁，则当前事务一定拿到了锁（如果没拿到锁阻塞也不可能执行到这里），那么就可以插入
-          if (is_only_txn) {
-            continue;
-          }
+          return true;
+        });
 
-          // wait-die
-          if (txn->get_transaction_id() > queue.oldest_txn_id_) {
-            throw TransactionAbortException(txn->get_transaction_id(),
-                                            AbortReason::DEADLOCK_PREVENTION);
-          }
+        // 中止检查
+        if (txn->get_state() == TransactionState::ABORTED) return false;
 
-          ++wait;
-          std::unique_lock ul(latch_, std::adopt_lock);
-          auto&& cur = queue.request_queue_.begin();
-          // 通过条件：当前请求之前没有任何已授权的请求并且不存在相交区间
-          queue.cv_.wait(ul, [&queue, txn, &cur, &it, &record]() {
-            for (auto& req : queue.request_queue_) {
-              if (req.txn_id_ != txn->get_transaction_id() && req.granted_) {
-                return false;
-              }
-            }
-            return true;
-          });
-          ul.release();
+        break;  // 退出当前检查循环
+      }
+    }
+
+    // 存在冲突需要重新检查
+    if (conflict_detected) continue;
+
+    // 获取或创建内层map (避免重复查找)
+    auto& inner_map = gap_lock_table_[index_meta];
+
+    // 检查3：目标间隙锁是否已存在
+    if (auto it = inner_map.find(lock_data_id); it != inner_map.end()) {
+      // 验证当前事务是否已持有锁
+      bool held_by_self = false;
+      for (auto& req : it->second.request_queue_) {
+        if (req.txn_id_ == txn->get_transaction_id() && req.granted_) {
+          held_by_self = true;
           break;
         }
       }
+
+      if (held_by_self) return true;  // 已持有锁
+
+      // 其他事务持有：需要等待
+      conflict_detected = true;
+      continue;
     }
-    if (wait == 0) {
-      auto predicate_manager = PredicateManager(index_meta);
 
-      // 手动写个 cond index_col = val
-      std::vector<Condition> conds(index_meta.cols.size());
-      int idx = 0;
-      for (auto& [index_offset, col_meta] : index_meta.cols) {
-        Value v;
-        v.raw = std::make_shared<RmRecord>(record.data + col_meta.offset,
-                                           col_meta.len);
-        switch (col_meta.type) {
-          case TYPE_INT: {
-            v.set_int(*reinterpret_cast<int*>(v.raw->data));
-            break;
-          }
-          case TYPE_FLOAT: {
-            v.set_float(*reinterpret_cast<float*>(v.raw->data));
-            break;
-          }
-          case TYPE_STRING: {
-            std::string s(v.raw->data, v.raw->size);
-            v.set_str(s);
-            break;
-          }
-        }
-        conds[idx].op = OP_EQ;
-        conds[idx].lhs_col = {"", col_meta.name};
-        conds[idx].rhs_val = std::move(v);
-        ++idx;
-      }
-      for (auto& cond : conds) {
-        predicate_manager.addPredicate(cond.lhs_col.col_name, cond);
-      }
+    // ==== 安全创建新间隙锁 ====
+    // 原子插入
+    auto [it, inserted] = inner_map.emplace(std::piecewise_construct,
+                                            std::forward_as_tuple(lock_data_id),
+                                            std::forward_as_tuple());
 
-      auto gap = Gap(predicate_manager.getIndexConds());
-
-      LockDataId lock_data_id(tab_fd, index_meta, gap, LockDataType::GAP);
-      auto it_ = gap_lock_table_.find(index_meta);
-      if (it_ == gap_lock_table_.end()) {
-        // 新建
-        it_ = gap_lock_table_
-                  .emplace(std::piecewise_construct,
-                           std::forward_as_tuple(index_meta),
-                           std::forward_as_tuple())
-                  .first;
-        it_->second.reserve(80);
-      }
-
-      // 这里实际上是加了一层唯一索引校验，如果两个事务同时插入一样的数据，即使过了第一层校验，也有可能两事务同时拿到这行的间隙锁
-      // 那么其中另外一个应该不满足索引一致性而抛出异常，其实也可以先申请行间隙锁，再校验唯一索引，但是这样如果不满足唯一索引不能立即返回了
-      // 按照 mysql 8.0 的实现，抛出异常
-      if (!it_->second
-               .emplace(std::piecewise_construct,
-                        std::forward_as_tuple(lock_data_id),
-                        std::forward_as_tuple())
-               .second) {
-        return false;
-        // throw NonUniqueIndexError(index_meta.tab_name, {});
-      }
-
-      auto& lock_request_queue = it_->second.at(lock_data_id);
-
-      // 每次事务申请锁都要更新最老事务id
-      if (txn->get_transaction_id() < lock_request_queue.oldest_txn_id_) {
-        lock_request_queue.oldest_txn_id_ = txn->get_transaction_id();
-      }
-
-      // 将当前事务锁请求加到锁请求队列中
-      lock_request_queue.request_queue_.emplace_back(txn->get_transaction_id(),
-                                                     LockMode::EXCLUSIVE, true);
-      // 更新锁请求队列锁模式为 X 锁
-      lock_request_queue.group_lock_mode_ = GroupLockMode::X;
+    if (inserted) {
+      LockRequestQueue& new_queue = it->second;
+      new_queue.oldest_txn_id_ = txn->get_transaction_id();
+      new_queue.request_queue_.emplace_back(txn->get_transaction_id(),
+                                            LockMode::EXCLUSIVE, true);
+      new_queue.group_lock_mode_ = GroupLockMode::X;
       txn->get_lock_set()->emplace(lock_data_id);
-      break;
+      return true;
     }
+
+    // 插入失败说明其他线程已创建，需要重新检查
+    conflict_detected = true;
   }
+
   return true;
 }
 
@@ -687,6 +692,8 @@ bool LockManager::lock_shared_on_record(Transaction* txn, const Rid& rid,
       std::unique_lock ul(latch_, std::adopt_lock);
       auto cur = lock_request_queue.request_queue_.begin();
       lock_request_queue.cv_.wait(ul, [&lock_request_queue, txn, &cur]() {
+        if (lock_request_queue.request_queue_.empty()) return true;
+
         for (auto it = lock_request_queue.request_queue_.begin();
              it != lock_request_queue.request_queue_.end(); ++it) {
           if (it->txn_id_ != txn->get_transaction_id()) {
@@ -1415,23 +1422,16 @@ bool LockManager::unlock(Transaction* txn, const LockDataId& lock_data_id) {
   } while (request != request_queue.end());
 
   // 维护队列锁模式，为空则无锁
-  // TODO 擦除锁表
   if (request_queue.empty()) {
-    // lock_request_queue.group_lock_mode_ = GroupLockMode::NON_LOCK;
-    // lock_request_queue.oldest_txn_id_ = INT32_MAX;
-    // 唤醒等待的事务
-    // lock_request_queue.cv_.notify_all();
+    // 先通知所有等待的事务，然后再删除队列
+    lock_request_queue.cv_.notify_all();
 
     if (lock_data_id.type_ == LockDataType::GAP) {
       // 相交的间隙锁也得唤醒
       for (auto& [data_id, queue] : ii->second) {
-        // if (queue.group_lock_mode_ != GroupLockMode::NON_LOCK) {
-        // if (data_id != lock_data_id) {
         if (lock_data_id.gap_.isCoincide(data_id.gap_)) {
           queue.cv_.notify_all();
         }
-        // }
-        // }
       }
       ii->second.erase(it);
     } else {
@@ -1443,15 +1443,17 @@ bool LockManager::unlock(Transaction* txn, const LockDataId& lock_data_id) {
 
   // 否则找到级别最高的锁和时间戳最小的事务
   auto max_lock_mode = LockMode::INTENTION_SHARED;
+  txn_id_t new_oldest_txn_id = INT32_MAX;
   for (auto& request : request_queue) {
     max_lock_mode = std::max(max_lock_mode, request.lock_mode_);
-    if (request.txn_id_ < lock_request_queue.oldest_txn_id_) {
-      lock_request_queue.oldest_txn_id_ = request.txn_id_;
+    if (request.txn_id_ < new_oldest_txn_id) {
+      new_oldest_txn_id = request.txn_id_;
     }
   }
 
   lock_request_queue.group_lock_mode_ =
       static_cast<GroupLockMode>(static_cast<int>(max_lock_mode) + 1);
+  lock_request_queue.oldest_txn_id_ = new_oldest_txn_id;
 
   // 唤醒等待的事务
   lock_request_queue.cv_.notify_all();
@@ -1459,11 +1461,9 @@ bool LockManager::unlock(Transaction* txn, const LockDataId& lock_data_id) {
   if (lock_data_id.type_ == LockDataType::GAP) {
     // 相交的锁表也得唤醒
     for (auto& [data_id, queue] : ii->second) {
-      // if (queue.group_lock_mode_ != GroupLockMode::NON_LOCK) {
       if (lock_data_id.gap_.isCoincide(data_id.gap_)) {
         queue.cv_.notify_all();
       }
-      // }
     }
   }
   return true;
